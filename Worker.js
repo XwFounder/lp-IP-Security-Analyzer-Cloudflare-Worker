@@ -3,6 +3,28 @@ const MANUAL_ABUSEIPDB_KEY = "";
 
 const APP_VERSION = "9.0.0-professional-no-datacenter-penalty";
 
+// =========================
+// Security / Privacy Config
+// =========================
+
+const MAX_REPORT_BODY_BYTES = 32 * 1024;
+const MAX_WEBRTC_CANDIDATES = 100;
+const MAX_CANDIDATE_STRING_LENGTH = 512;
+
+const ALLOWED_ORIGINS = new Set([
+  // 如果你有自己的正式域名，在这里加入
+  // "https://example.com",
+]);
+
+const ENABLE_EXTERNAL_IP_LOOKUPS = true;
+
+// true = API 返回最少必要信息
+// false = 返回更多调试信息
+const PRIVACY_MODE = true;
+
+// 默认不返回第三方 API 的 raw 原始数据
+const EXPOSE_RAW_PROVIDER_DATA = false;
+
 const PROJECT_GITHUB = "https://github.com/TheGreatAzizi/IP-Security-Analyzer-Cloudflare-Worker";
 const AUTHOR_X = "https://x.com/the_azzi";
 const AUTHOR_TELEGRAM = "https://t.me/luluch_code";
@@ -109,7 +131,18 @@ function htmlResponse(body) {
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
       "x-frame-options": "DENY",
-      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+      "permissions-policy":
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+      "content-security-policy":
+        "default-src 'self'; " +
+        "script-src 'self' 'unsafe-inline'; " +
+        "style-src 'self' 'unsafe-inline'; " +
+        "img-src 'self' data:; " +
+        "connect-src 'self' https://api.ipinfo.io https://api.abuseipdb.com; " +
+        "font-src 'self' data:; " +
+        "object-src 'none'; " +
+        "base-uri 'none'; " +
+        "frame-ancestors 'none';"
     }
   });
 }
@@ -156,16 +189,42 @@ function isPrivateOrLocalIp(ip) {
 }
 
 function getClientIp(request) {
-  const h = request.headers;
-  const forwarded = h.get("x-forwarded-for");
+  // Cloudflare Worker 环境下，优先使用 Cloudflare 提供的
+  // CF-Connecting-IP，不信任用户自行提交的 X-Forwarded-For 等 Header。
+  const cfIp = request.headers.get("cf-connecting-ip");
 
-  return (
-    h.get("cf-connecting-ip") ||
-    h.get("true-client-ip") ||
-    h.get("x-real-ip") ||
-    (forwarded ? forwarded.split(",")[0].trim() : "") ||
-    "unknown"
+  if (cfIp && isValidIp(cfIp)) {
+    return cfIp.trim();
+  }
+
+  return "unknown";
+}
+
+function isValidIp(ip) {
+  const value = String(ip || "").trim();
+
+  if (!value || value.length > 64) {
+    return false;
+  }
+
+  // IPv4
+  const ipv4 = value.match(
+    /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
   );
+
+  if (ipv4) {
+    return ipv4.slice(1).every(function (part) {
+      const n = Number(part);
+      return n >= 0 && n <= 255;
+    });
+  }
+
+  // 基础 IPv6 校验
+  if (value.includes(":")) {
+    return /^[0-9a-f:]+$/i.test(value);
+  }
+
+  return false;
 }
 
 function getBaseServerData(request) {
@@ -214,6 +273,55 @@ function getBaseServerData(request) {
   };
 }
 
+
+async function readJsonBody(request) {
+  const contentLength = Number(
+    request.headers.get("content-length") || 0
+  );
+
+  if (contentLength > MAX_REPORT_BODY_BYTES) {
+    return {
+      ok: false,
+      status: 413,
+      error: "Request body too large."
+    };
+  }
+
+  const contentType = String(
+    request.headers.get("content-type") || ""
+  ).toLowerCase();
+
+  if (!contentType.includes("application/json")) {
+    return {
+      ok: false,
+      status: 415,
+      error: "Content-Type must be application/json."
+    };
+  }
+
+  const text = await request.text();
+
+  if (new TextEncoder().encode(text).length > MAX_REPORT_BODY_BYTES) {
+    return {
+      ok: false,
+      status: 413,
+      error: "Request body too large."
+    };
+  }
+
+  try {
+    return {
+      ok: true,
+      data: JSON.parse(text)
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Invalid JSON."
+    };
+  }
+}
 async function safeFetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(function () {
@@ -319,11 +427,13 @@ async function lookupAbuseIpdb(ip, env) {
 }
 
 function parseIpinfoLite(payload) {
-  if (!payload || !payload.ok || !payload.data) return null;
+  if (!payload || !payload.ok || !payload.data) {
+    return null;
+  }
 
   const d = payload.data;
 
-  return {
+  const result = {
     ip: d.ip || "",
     asn: d.asn || "",
     asName: d.as_name || "",
@@ -331,17 +441,29 @@ function parseIpinfoLite(payload) {
     countryCode: d.country_code || "",
     country: d.country || "",
     continentCode: d.continent_code || "",
-    continent: d.continent || "",
-    raw: d
+    continent: d.continent || ""
   };
+
+  if (EXPOSE_RAW_PROVIDER_DATA) {
+    result.raw = d;
+  }
+
+  return result;
 }
 
 function parseAbuseIpdb(payload) {
-  if (!payload || !payload.ok || !payload.data || !payload.data.data) return null;
+  if (
+    !payload ||
+    !payload.ok ||
+    !payload.data ||
+    !payload.data.data
+  ) {
+    return null;
+  }
 
   const d = payload.data.data;
 
-  return {
+  const result = {
     ipAddress: d.ipAddress || "",
     isPublic: Boolean(d.isPublic),
     ipVersion: d.ipVersion || null,
@@ -356,9 +478,16 @@ function parseAbuseIpdb(payload) {
     usageType: d.usageType || "",
     isp: d.isp || "",
     domain: d.domain || "",
-    hostnames: Array.isArray(d.hostnames) ? d.hostnames : [],
-    raw: d
+    hostnames: Array.isArray(d.hostnames)
+      ? d.hostnames.slice(0, 20)
+      : []
   };
+
+  if (EXPOSE_RAW_PROVIDER_DATA) {
+    result.raw = d;
+  }
+
+  return result;
 }
 
 function classifyLocal(base, ipinfoLite, abuse) {
@@ -705,105 +834,106 @@ function buildRiskAnalysis(base, local, ipinfoLite, abuse) {
 }
 
 function parseWebrtcReport(serverIp, report) {
-  const candidates = Array.isArray(report && report.candidates) ? report.candidates : [];
-  const ips = [];
-
-  candidates.forEach(function (c) {
-    const ip = String((c && c.ip) || "").trim();
-    if (ip && ips.indexOf(ip) === -1) ips.push(ip);
-  });
-
-  const privateOrLocal = ips.filter(isPrivateOrLocalIp);
-  const mdns = ips.filter(function (ip) {
-    return ip.endsWith(".local");
-  });
-  const publicIps = ips.filter(function (ip) {
-    return !isPrivateOrLocalIp(ip) && !ip.endsWith(".local");
-  });
-  const leakedPublicIps = publicIps.filter(function (ip) {
-    return ip !== serverIp;
-  });
-  const sameAsHttpIp = publicIps.indexOf(serverIp) !== -1;
-
   const findings = [];
-  let scoreImpact = 0;
-  let state = "protected_or_blocked";
+  const candidates = Array.isArray(report && report.candidates)
+    ? report.candidates.slice(0, MAX_WEBRTC_CANDIDATES)
+    : [];
+
+  const uniqueIps = new Set();
+
+  function addFinding(id, severity, message, evidence) {
+    findings.push({
+      id: id,
+      severity: severity,
+      points: 0,
+      message: message,
+      evidence: evidence || {}
+    });
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") {
+      continue;
+    }
+
+    const ip = String(candidate.ip || "").trim();
+
+    if (!ip || ip.length > 64) {
+      continue;
+    }
+
+    if (!isValidIp(ip)) {
+      continue;
+    }
+
+    uniqueIps.add(ip);
+  }
+
+  const publicIps = [];
+  const privateIps = [];
+
+  for (const ip of uniqueIps) {
+    if (isPrivateOrLocalIp(ip)) {
+      privateIps.push(ip);
+    } else {
+      publicIps.push(ip);
+    }
+  }
+
+  const normalizedServerIp = String(serverIp || "").trim();
+
+  const leakedPublicIps = publicIps.filter(function (ip) {
+    return ip !== normalizedServerIp;
+  });
 
   if (leakedPublicIps.length > 0) {
-    state = "public_ip_leak_detected";
-    scoreImpact += 45;
-    findings.push({
-      id: "webrtc_public_ip_mismatch",
-      severity: "critical",
-      points: 45,
-      message: "WebRTC exposed public IPs different from the HTTP IP seen by Cloudflare.",
-      evidence: {
-        httpIp: serverIp,
-        leakedPublicIps: leakedPublicIps
+    addFinding(
+      "public_ip_leak_detected",
+      "high",
+      "WebRTC exposed a public IP address different from the HTTP server IP.",
+      {
+        leakedPublicIps: leakedPublicIps.slice(0, 10),
+        serverIp: normalizedServerIp
       }
-    });
-  } else if (sameAsHttpIp) {
-    state = "webrtc_public_ip_matches_http_ip";
-    findings.push({
-      id: "webrtc_public_ip_same_as_http",
-      severity: "info",
-      points: 0,
-      message: "WebRTC exposed the same public IP as the HTTP connection. No proxy bypass leak detected from this signal.",
-      evidence: {
-        httpIp: serverIp
+    );
+  } else if (publicIps.length > 0) {
+    addFinding(
+      "webrtc_public_ip_matches_http",
+      "info",
+      "WebRTC exposed a public IP, but it matches the HTTP connection IP.",
+      {
+        publicIps: publicIps.slice(0, 10)
       }
-    });
+    );
   }
 
-  if (privateOrLocal.length > 0) {
-    scoreImpact += 10;
-    findings.push({
-      id: "webrtc_local_ip_or_hostname_exposed",
-      severity: "medium",
-      points: 10,
-      message: "WebRTC exposed local/private IPs or local hostnames.",
-      evidence: {
-        privateOrLocal: privateOrLocal
+  if (privateIps.length > 0) {
+    addFinding(
+      "private_ip_exposed",
+      "low",
+      "WebRTC exposed a private or local network address.",
+      {
+        privateIps: privateIps.slice(0, 10)
       }
-    });
+    );
   }
 
-  if (mdns.length > 0) {
-    findings.push({
-      id: "webrtc_mdns_masking",
-      severity: "info",
-      points: 0,
-      message: "Browser used mDNS masking for local candidates.",
-      evidence: {
-        mdns: mdns
-      }
-    });
-  }
-
-  if (candidates.length === 0) {
-    findings.push({
-      id: "webrtc_no_candidates",
-      severity: "info",
-      points: 0,
-      message: "No WebRTC candidates were exposed. WebRTC may be disabled, blocked, or protected by browser/VPN.",
-      evidence: {}
-    });
+  if (!uniqueIps.size) {
+    addFinding(
+      "no_webrtc_ip_candidates",
+      "info",
+      "No usable IP candidates were exposed by the browser."
+    );
   }
 
   return {
-    state: state,
-    leakDetected: leakedPublicIps.length > 0 || privateOrLocal.length > 0,
-    httpIp: serverIp,
+    leakDetected: leakedPublicIps.length > 0,
+    publicIps: publicIps.slice(0, 20),
+    privateIps: privateIps.slice(0, 20),
+    leakedPublicIps: leakedPublicIps.slice(0, 20),
     candidateCount: candidates.length,
-    ips: ips,
-    publicIps: publicIps,
-    privateOrLocal: privateOrLocal,
-    mdns: mdns,
-    leakedPublicIps: leakedPublicIps,
-    sameAsHttpIp: sameAsHttpIp,
-    scoreImpact: scoreImpact,
-    findings: findings,
-    candidates: candidates
+    uniqueIpCount: uniqueIps.size,
+    findings: findings
   };
 }
 
@@ -909,34 +1039,92 @@ async function buildFullAnalysis(request, env) {
 }
 
 async function handleReport(request, env) {
-  const analysis = await buildFullAnalysis(request, env);
-
-  let report = {};
-  try {
-    report = await request.json();
-  } catch (err) {
-    return jsonResponse({
-      status: "error",
-      error: "Invalid JSON body"
-    }, 400);
+  if (request.method !== "POST") {
+    return jsonResponse(
+      {
+        ok: false,
+        error: "Method Not Allowed"
+      },
+      405,
+      request
+    );
   }
 
-  const webrtc = parseWebrtcReport(analysis.ip.address, report);
-  const combinedScore = clamp(analysis.risk.score - webrtc.scoreImpact, 0, 100);
+  const parsed = await readJsonBody(request);
 
-  let verdict = "Low Risk";
-  if (combinedScore < 35) verdict = "Critical Risk";
-  else if (combinedScore < 60) verdict = "High Risk";
-  else if (combinedScore < 80) verdict = "Medium Risk";
+  if (!parsed.ok) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: parsed.error
+      },
+      parsed.status || 400,
+      request
+    );
+  }
 
-  return jsonResponse(Object.assign({}, analysis, {
-    browserLeakTest: webrtc,
-    combinedRisk: {
-      score: combinedScore,
-      verdict: verdict,
-      findings: analysis.risk.findings.concat(webrtc.findings)
-    }
-  }));
+  const body = parsed.data || {};
+
+  if (
+    !Array.isArray(body.candidates) ||
+    body.candidates.length > MAX_WEBRTC_CANDIDATES
+  ) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: "Invalid or excessive WebRTC candidates."
+      },
+      400,
+      request
+    );
+  }
+
+  // 限制单个 candidate 大小
+  const safeCandidates = body.candidates
+    .slice(0, MAX_WEBRTC_CANDIDATES)
+    .filter(function (candidate) {
+      if (!candidate || typeof candidate !== "object") {
+        return false;
+      }
+
+      const ip = String(candidate.ip || "");
+
+      return ip.length <= MAX_CANDIDATE_STRING_LENGTH;
+    })
+    .map(function (candidate) {
+      return {
+        ip: String(candidate.ip || "").slice(0, 64),
+        type: String(candidate.type || "").slice(0, 32)
+      };
+    });
+
+  const sanitizedBody = {
+    candidates: safeCandidates,
+    userAgent: String(body.userAgent || "").slice(0, 512),
+    language: String(body.language || "").slice(0, 128),
+    platform: String(body.platform || "").slice(0, 128),
+    secureContext: Boolean(body.secureContext)
+  };
+
+  // 到这里才开始服务器端分析
+  const analysis = await buildFullAnalysis(request, env);
+
+  const webrtc = parseWebrtcReport(
+    analysis.server.ip,
+    sanitizedBody
+  );
+
+  return jsonResponse(
+    {
+      ok: true,
+      server: analysis.server,
+      classification: analysis.classification,
+      risk: analysis.risk,
+      webrtc: webrtc
+    },
+    200,
+    request
+  );
 }
 
 function scoreClass(score) {
