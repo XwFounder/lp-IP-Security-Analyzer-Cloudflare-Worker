@@ -130,7 +130,6 @@ function htmlResponse(body) {
       "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
       "x-content-type-options": "nosniff",
       "referrer-policy": "no-referrer",
-      "x-frame-options": "DENY",
       "permissions-policy":
         "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
       "content-security-policy":
@@ -141,8 +140,7 @@ function htmlResponse(body) {
         "connect-src 'self' https://api.ipinfo.io https://api.abuseipdb.com; " +
         "font-src 'self' data:; " +
         "object-src 'none'; " +
-        "base-uri 'none'; " +
-        "frame-ancestors 'none';"
+        "base-uri 'none';"
     }
   });
 }
@@ -1903,6 +1901,26 @@ export default {
       return handleReport(request, env);
     }
 
-    return htmlResponse(renderPage(await buildFullAnalysis(request, env)));
+    try {
+      const analysis = await buildFullAnalysis(request, env);
+      return htmlResponse(renderPage(analysis));
+    } catch (err) {
+      return new Response(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Worker Error</title></head>" +
+        "<body style=\"font-family:Arial,sans-serif;padding:30px;background:#111827;color:#fff\">" +
+        "<h1>Worker Runtime Error</h1>" +
+        "<pre style=\"white-space:pre-wrap;background:#1f2937;padding:20px;border-radius:10px\">" +
+        escapeHtml(err && err.stack ? err.stack : String(err)) +
+        "</pre></body></html>",
+        {
+          status: 500,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff"
+          }
+        }
+      );
+    }
   }
 };
